@@ -1,0 +1,7 @@
+.env
+firmware/tremor_wearable/secrets.h
+data/*
+!data/.gitkeep
+__pycache__/
+.venv/
+.pytest_cache/
