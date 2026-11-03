@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Annotated, Literal, Optional, Union
 
 import numpy as np
+
+try:
+    from ml_online import Online
+except ImportError:  # allows importing the server in minimal test environments
+    Online = None
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -65,7 +70,11 @@ class Hub:
         self.counts = {"imu": 0, "vit": 0, "evt": 0, "bad": 0}
         self.events, self.buf = deque(maxlen=100), deque(maxlen=WIN)
         self.last_fft, self.rec, self.rec_name, self.sim_active = 0.0, None, None, False
+        self.last_ml = None
 hub = Hub()
+online_model = None
+model_load_error = None
+model_errors = 0
 
 async def bcast(obj):
     txt = json.dumps(obj)
@@ -102,9 +111,23 @@ async def handle(m, sim=False):
     hub.last_rx = time.time()
     if m.type == "hello": hub.hello = d
     elif m.type == "imu":
+        global model_errors
         hub.counts["imu"] += 1
         if hub.last_seq is not None and m.seq > hub.last_seq + 1: hub.lost += m.seq - hub.last_seq - 1
         hub.last_seq = m.seq; hub.buf.extend(m.s)
+        # Run the trained MATLAB-exported tree on the same real IMU samples.
+        # Online returns None until it has a complete 4-second window.
+        if online_model is not None:
+            try:
+                prediction = online_model.push_packet(m.seq, m.s)
+                if prediction is not None:
+                    prediction["sim"] = bool(sim)
+                    prediction["received_at"] = time.time()
+                    hub.last_ml = prediction
+                    await bcast(prediction)
+            except Exception as exc:
+                model_errors += 1
+                print("ML inference error:", str(exc)[:200])
         if len(hub.buf) == WIN and time.time() - hub.last_fft > 0.5:
             hub.last_fft = time.time(); await bcast({**analyse(), "sim": sim})
     elif m.type == "vit": hub.vit = d; hub.counts["vit"] += 1
@@ -147,18 +170,39 @@ async def status_loop():
 
 @asynccontextmanager
 async def lifespan(_):
+    global online_model, model_load_error
+    spec_path = ROOT / "models" / "spec.json"
+    online_model, model_load_error = None, None
+    if spec_path.is_file() and Online is not None:
+        try:
+            online_model = Online(spec_path)
+            print("ML model loaded:", online_model.spec.get("version", "unknown"))
+        except Exception as e:
+            model_load_error = str(e)
+            print("ML model not loaded:", model_load_error)
+    else:
+        print("ML model not loaded: models/spec.json is absent")
     tasks = [asyncio.create_task(status_loop())] + ([asyncio.create_task(simulator())] if SIM else [])
     yield
     for t in tasks: t.cancel()
     if hub.rec: hub.rec.close(); hub.rec = None
 
+from fastapi.staticfiles import StaticFiles
+
 app = FastAPI(title="Tremor wearable backend", version=VERSION, lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_methods=["GET", "POST"],
-                   allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(","))
+                   allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000,http://localhost:5173,http://127.0.0.1:5173").split(","))
+
+_dist_assets = ROOT / "frontend" / "dist" / "assets"
+if _dist_assets.exists():
+    app.mount("/assets", StaticFiles(directory=_dist_assets), name="assets")
 
 # ------------------------------------------------------------------ routes
 @app.get("/")
 def index():
+    dist_file = ROOT / "frontend" / "dist" / "index.html"
+    if dist_file.exists():
+        return FileResponse(dist_file)
     f = ROOT / "frontend" / "index.html"
     if not f.exists(): raise HTTPException(404, "frontend/index.html missing")
     return FileResponse(f)
@@ -167,10 +211,30 @@ def index():
 def health():
     state, age = device_state()
     return {"status": "ok", "server": VERSION, "schema": SCHEMA_V, "device": state, "last_packet_age_s": None if age is None else round(age, 1),
-            "simulator_enabled": SIM, "recording": hub.rec_name, "counts": hub.counts, "lost_imu_batches": hub.lost}
+            "simulator_enabled": SIM, "recording": hub.rec_name, "counts": hub.counts, "lost_imu_batches": hub.lost, "ml_model_loaded": online_model is not None, "ml_model_version": online_model.spec.get("version") if online_model else None, "ml_model_error": model_load_error, "ml_errors": model_errors,
+            "last_prediction": hub.last_ml}
 
 @app.get("/api/events")
 def events(): return list(hub.events)
+
+@app.get("/api/model/metrics")
+def model_metrics():
+    """Return offline session-grouped cross-validation metrics exported by MATLAB."""
+    p = ROOT / "models" / "metrics.json"
+    if not p.is_file():
+        raise HTTPException(404, "Model metrics are not available. Train the MATLAB model first.")
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(500, f"Could not read model metrics: {exc}")
+
+@app.get("/api/model/status")
+def model_status():
+    return {"loaded": online_model is not None,
+            "version": online_model.spec.get("version") if online_model else None,
+            "load_error": model_load_error,
+            "inference_errors": model_errors,
+            "last_prediction": hub.last_ml}
 
 REC_RE = re.compile(r"^session_\d{8}_\d{6}(_sim)?\.jsonl$")
 
@@ -208,7 +272,7 @@ def recording(name: str, format: Literal["jsonl", "csv"] = "jsonl"):
 @app.websocket("/ws/dashboard")
 async def dashboard(ws: WebSocket):
     await ws.accept(); hub.ui.add(ws)
-    await ws.send_text(json.dumps({"type": "snapshot", "hello": hub.hello, "vit": hub.vit, "events": list(hub.events)}))
+    await ws.send_text(json.dumps({"type": "snapshot", "hello": hub.hello, "vit": hub.vit, "events": list(hub.events), "ml": hub.last_ml}))
     await ws.send_text(json.dumps(status_msg()))
     try:
         while True: await ws.receive_text()
@@ -221,7 +285,9 @@ async def telemetry(ws: WebSocket, token: str = Query("")):
         await ws.close(code=4401); return
     await ws.accept()
     hub.dev, hub.sim_active, hub.last_seq, hub.hello = ws, False, None, None
-    hub.buf.clear(); print("ESP32 connected")
+    hub.buf.clear(); hub.last_ml = None
+    if online_model is not None: online_model.reset()
+    print("ESP32 connected")
     try:
         while True:
             txt = await ws.receive_text()

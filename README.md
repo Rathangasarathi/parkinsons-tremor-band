@@ -21,7 +21,7 @@ OLED  ───┘            │ Wi-Fi / WebSocket     └─ event queue (16) 
 | `firmware/tremor_wearable/` | Arduino sketch. Settings in `config.h`; Wi-Fi/server in `secrets.h` (copy of `secrets.example.h`, git-ignored) |
 | `tools/i2c_scanner/` | Run first to confirm each module's I²C address |
 | `backend/server.py` | FastAPI app (`python server.py`) |
-| `frontend/index.html` | Dashboard (served by the backend, no build step / npm) |
+| `frontend/` | React 18 + TypeScript + Vite + Tailwind CSS dashboard (`npm install && npm run build`) |
 | `hardware/wiring.md`, `hardware/checklists.md` | Pin map, wiring, power design, soldering + test checklists |
 | `tests/` | Automated backend tests and a fake ESP32 for end-to-end checks |
 | `data/` | Recordings and events (git-ignored) |
