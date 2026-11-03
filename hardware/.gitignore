@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Build files
+dist/
+build/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# macOS
+.DS_Store
+
+# TypeScript
+*.tsbuildinfo
